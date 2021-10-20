@@ -280,6 +280,7 @@
 #include <linux/uaccess.h>
 #include <asm/ioctls.h>
 #include <net/busy_poll.h>
+#include <linux/dma-buf.h>
 
 /* Track pending CMSGs. */
 enum {
@@ -463,6 +464,8 @@ void tcp_init_sock(struct sock *sk)
 
 	sk_sockets_allocated_inc(sk);
 	sk->sk_route_forced_caps = NETIF_F_GSO;
+
+	xa_init_flags(&sk->sk_pagepool, XA_FLAGS_ALLOC);
 }
 EXPORT_SYMBOL(tcp_init_sock);
 
@@ -2281,6 +2284,151 @@ static int tcp_inq_hint(struct sock *sk)
 	return inq;
 }
 
+static int tcp_recvmsg_devmem(const struct sock *sk, const struct sk_buff *skb,
+			      int offset, struct msghdr *msg, int len)
+{
+	int start = skb_headlen(skb);
+	struct sk_buff *frag_iter;
+	int i, copy = start - offset, n;
+	struct devmemvec devmemvec = { 0 };
+	int err = 0, tokens_added_idx = 0;
+	u32 *tokens_added;
+
+	if (!skb->devmem)
+		return -ENODEV;
+
+	tokens_added = kzalloc(sizeof(u32) * skb_shinfo(skb)->nr_frags,
+			       GFP_KERNEL);
+
+	if (!tokens_added)
+		return -ENOMEM;
+
+	/* Copy header. */
+	if (copy > 0) {
+		copy = min(copy, len);
+
+		n = copy_to_iter(skb->data + offset, copy, &msg->msg_iter);
+		if (n != copy) {
+			err = -EFAULT;
+			goto err_release_pages;
+		}
+
+		offset += copy;
+		len -= copy;
+
+		/* First a devmemvec for # bytes copied to user buffer */
+		devmemvec.frag_size = copy;
+		if (len == 0)
+			devmemvec.frag_token |= 1 << 31;
+		err = put_cmsg(msg, SOL_SOCKET, SO_DEVMEM_HEADER,
+			       sizeof(devmemvec), &devmemvec);
+		if (err)
+			goto err_release_pages;
+
+		if (len == 0)
+			goto out;
+	}
+
+	/* after that, send information of devmem pages through a sequence
+	 * of cmsg
+	 */
+	for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
+		const skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
+		struct page *page = skb_frag_page(frag);
+		struct dma_buf_pages_file_priv *priv;
+		u32 user_token, frag_offset;
+		struct page *dmabuf_pages;
+		int end;
+
+		end = start + skb_frag_size(frag);
+		copy = end - offset;
+		memset(&devmemvec, 0, sizeof(devmemvec));
+
+		if (copy > 0) {
+			copy = min(copy, len);
+
+			priv = container_of(page->pgmap,
+					    struct dma_buf_pages_file_priv,
+					    pgmap);
+
+			dmabuf_pages = priv->pages;
+			frag_offset = ((page - dmabuf_pages) << PAGE_SHIFT) +
+				      skb_frag_off(frag) + offset - start;
+			devmemvec.frag_offset = frag_offset;
+			devmemvec.frag_size = copy;
+			err = xa_alloc((struct xarray *)&sk->sk_pagepool,
+				       &user_token, page, xa_limit_31b,
+				       GFP_KERNEL);
+			if (err)
+				goto err_release_pages;
+
+			tokens_added[tokens_added_idx++] = user_token;
+
+			get_page(page);
+			devmemvec.frag_token = user_token;
+
+			offset += copy;
+			len -= copy;
+
+			if (len == 0)
+				devmemvec.frag_token |= 1 << 31;
+
+			err = put_cmsg(msg, SOL_SOCKET, SO_DEVMEM_OFFSET,
+				       sizeof(devmemvec), &devmemvec);
+			if (err)
+				goto err_release_pages;
+
+			if (len == 0)
+				goto out;
+		}
+		start = end;
+	}
+
+	if (!len)
+		goto out;
+
+	/* if len is not satisfied yet, we need to skb_walk_frags() to satisfy
+	 * len
+	 */
+	skb_walk_frags(skb, frag_iter)
+	{
+		int end;
+
+		WARN_ON(start > offset + len);
+		end = start + frag_iter->len;
+		copy = end - offset;
+		if (copy > 0) {
+			if (copy > len)
+				copy = len;
+			err = tcp_recvmsg_devmem(sk, frag_iter, offset - start,
+						 msg, copy);
+			if (err)
+				goto err_release_pages;
+			len -= copy;
+			if (len == 0)
+				goto out;
+			offset += copy;
+		}
+		start = end;
+	}
+
+	if (len) {
+		err = -EFAULT;
+		goto err_release_pages;
+	}
+
+	goto out;
+
+err_release_pages:
+	for (i = 0; i < tokens_added_idx; i++)
+		put_page(xa_erase((struct xarray *)&sk->sk_pagepool,
+				  tokens_added[i]));
+
+out:
+	kfree(tokens_added);
+	return err;
+}
+
 /*
  *	This routine copies from a sock struct into the user buffer.
  *
@@ -2467,7 +2615,23 @@ found_ok_skb:
 			}
 		}
 
-		if (!(flags & MSG_TRUNC)) {
+		if (skb->devmem) {
+			if (!(flags & MSG_SOCK_DEVMEM)) {
+				/* skb->devmem skbs can only be received with
+				 * the MSG_SOCK_DEVMEM flag.
+				 */
+
+				copied = -EFAULT;
+				break;
+			}
+
+			err = tcp_recvmsg_devmem(sk, skb, offset, msg, used);
+			if (err) {
+				if (!copied)
+					copied = -EFAULT;
+				break;
+			}
+		} else if (!(flags & MSG_TRUNC)) {
 			err = skb_copy_datagram_msg(skb, offset, msg, used);
 			if (err) {
 				/* Exception. Bailout! */
