@@ -1419,7 +1419,7 @@ int skb_copy_ubufs(struct sk_buff *skb, gfp_t gfp_mask)
 	int i, new_frags;
 	u32 d_off;
 
-	if (skb_shared(skb) || skb_unclone(skb, gfp_mask))
+	if (skb_shared(skb) || skb_unclone(skb, gfp_mask) || skb->devmem)
 		return -EINVAL;
 
 	if (!num_frags)
@@ -5378,7 +5378,10 @@ bool skb_try_coalesce(struct sk_buff *to, struct sk_buff *from,
 	if (to->pp_recycle != from->pp_recycle)
 		return false;
 
-	if (len <= skb_tailroom(to)) {
+	if (from->devmem != to->devmem)
+		return false;
+
+	if (len <= skb_tailroom(to) && !from->devmem) {
 		if (len)
 			BUG_ON(skb_copy_bits(from, 0, skb_put(to, len), len));
 		*delta_truesize = 0;
@@ -6376,7 +6379,7 @@ void skb_condense(struct sk_buff *skb)
 {
 	if (skb->data_len) {
 		if (skb->data_len > skb->end - skb->tail ||
-		    skb_cloned(skb))
+		    skb_cloned(skb) || skb->devmem)
 			return;
 
 		/* Nice, we can free page frag(s) right now */
