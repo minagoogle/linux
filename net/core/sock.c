@@ -1367,6 +1367,70 @@ set_sndbuf:
 					  ~SOCK_BUF_LOCK_MASK);
 		break;
 
+	case SO_DEVMEM_DONTNEED:
+	{
+		struct devmemtoken singleton_token, *tokens;
+		unsigned int num_tokens, i, j;
+
+		if (unlikely(sk->sk_protocol == IPPROTO_TCP)) {
+			ret = -EBADF;
+			break;
+		}
+		if (optlen < sizeof(*tokens) ||
+		    (optlen % sizeof(*tokens) != 0)) {
+			ret = -EINVAL;
+			break;
+		}
+		if (optlen == sizeof(*tokens)) {
+			if (copy_from_sockptr(&singleton_token, optval,
+					      sizeof(*tokens))) {
+				ret = -EFAULT;
+				break;
+			}
+			num_tokens = 1;
+			tokens = &singleton_token;
+		} else {
+			if (optlen > 4096) {
+				ret = -EINVAL;
+				break;
+			}
+			num_tokens = optlen / sizeof(*tokens);
+			tokens = kmalloc(optlen, GFP_KERNEL);
+			if (!tokens) {
+				ret = -ENOMEM;
+				break;
+			}
+			if (copy_from_sockptr(tokens, optval, optlen)) {
+				kfree(tokens);
+				ret = -EFAULT;
+				break;
+			}
+		}
+
+		ret = 0;
+
+		for (i = 0; i < num_tokens; i++) {
+			for (j = 0; j < tokens[i].token_count; j++) {
+				struct page *pg = xa_erase(&sk->sk_pagepool,
+							   tokens[i].token_start + j);
+
+				if (pg)
+					put_page(pg);
+				else
+					/* -EINTR here notifies the userspace
+					 * that not all tokens passed to it have
+					 * been freed.
+					 */
+					ret = -EINTR;
+			}
+		}
+
+		if (num_tokens > 1)
+			kfree(tokens);
+
+		break;
+	}
+
 	default:
 		ret = -ENOPROTOOPT;
 		break;
