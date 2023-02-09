@@ -48,6 +48,7 @@
 #include <uapi/linux/pkt_cls.h>
 #include <linux/hashtable.h>
 #include <linux/rbtree.h>
+#include <linux/dma-buf.h>
 
 struct netpoll_info;
 struct device;
@@ -739,6 +740,31 @@ struct netdev_rx_queue {
 #endif
 	struct file __rcu		*dmabuf_pages;
 } ____cacheline_aligned_in_smp;
+
+struct page *
+__netdev_rxq_alloc_page_from_dmabuf_pool(struct netdev_rx_queue *rxq, int nid,
+					 gfp_t gfp_mask, unsigned int order);
+
+static inline struct page *netdev_rxq_alloc_page(struct netdev_rx_queue *rxq,
+						 int nid, gfp_t gfp_mask,
+						 unsigned int order)
+{
+	if (unlikely(rcu_access_pointer(rxq->dmabuf_pages)))
+		return __netdev_rxq_alloc_page_from_dmabuf_pool(
+			rxq, nid, gfp_mask, order);
+
+	return __alloc_pages_node(nid, gfp_mask, order);
+}
+
+static inline void netdev_rxq_free_page(struct page *pg)
+{
+	if (is_dma_buf_page(pg)) {
+		put_page(pg);
+		return;
+	}
+
+	__free_page(pg);
+}
 
 /*
  * RX queue sysfs structures and functions.
