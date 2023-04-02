@@ -82,6 +82,11 @@ struct dma_buf_create_pages_info {
 	__s32 direction;
 };
 
+struct dma_buf_pages_bind_rx_queue {
+	char ifname[IFNAMSIZ];
+	__u32 rxq_idx;
+};
+
 #define DMA_BUF_SYNC_READ      (1 << 0)
 #define DMA_BUF_SYNC_WRITE     (2 << 0)
 #define DMA_BUF_SYNC_RW        (DMA_BUF_SYNC_READ | DMA_BUF_SYNC_WRITE)
@@ -103,5 +108,6 @@ struct dma_buf_create_pages_info {
 #define DMA_BUF_SET_NAME_B	_IOW(DMA_BUF_BASE, 1, u64)
 
 #define DMA_BUF_CREATE_PAGES	_IOW(DMA_BUF_BASE, 2, struct dma_buf_create_pages_info)
+#define DMA_BUF_PAGES_BIND_RX	_IOW(DMA_BUF_BASE, 3, struct dma_buf_pages_bind_rx_queue)
 
 #endif

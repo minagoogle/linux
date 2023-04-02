@@ -25,6 +25,7 @@
 #include <linux/dma-resv.h>
 #include <linux/mm.h>
 #include <linux/mount.h>
+#include <linux/netdevice.h>
 #include <linux/pseudo_fs.h>
 
 #include <uapi/linux/dma-buf.h>
@@ -1373,10 +1374,25 @@ void dma_buf_vunmap(struct dma_buf *dmabuf, struct dma_buf_map *map)
 }
 EXPORT_SYMBOL_GPL(dma_buf_vunmap);
 
+DEFINE_MUTEX(bind_rx_queue_mutex);
+
 static int dma_buf_pages_release(struct inode *inode, struct file *file)
 {
 	struct dma_buf_pages_file_priv *priv = file->private_data;
+	struct netdev_rx_queue *rxq;
+	struct file *old_pages;
+	unsigned long xa_idx;
 	int i;
+
+	xa_for_each(&priv->bound_rxq_list, xa_idx, rxq) {
+		mutex_lock(&bind_rx_queue_mutex);
+		old_pages = rcu_dereference_protected(rxq->dmabuf_pages,
+						      mutex_is_locked(&bind_rx_queue_mutex));
+		if (old_pages == file)
+			rcu_assign_pointer(rxq->dmabuf_pages, NULL);
+		mutex_unlock(&bind_rx_queue_mutex);
+		dev_put(rxq->dev);
+	}
 
 	if (priv->tx_bv) {
 		for (i = 0; i < priv->num_pages; i++)
@@ -1393,6 +1409,85 @@ static int dma_buf_pages_release(struct inode *inode, struct file *file)
 	percpu_ref_put(priv->pgmap.ref);
 
 	return 0;
+}
+
+static int
+dma_buf_pages_bind_rx_queue(struct file *file,
+			    struct dma_buf_pages_bind_rx_queue *bind_rx_queue)
+{
+	struct dma_buf_pages_file_priv *priv = file->private_data;
+	struct netdev_rx_queue *rxq;
+	struct net_device *netdev;
+	int xa_id;
+	int err;
+
+	if (!capable(CAP_NET_ADMIN))
+		return -EPERM;
+
+	if (!priv->page_pool)
+		return -ENOTTY;
+
+	bind_rx_queue->ifname[IFNAMSIZ - 1] = '\0';
+
+	netdev = dev_get_by_name(current->nsproxy->net_ns,
+				 bind_rx_queue->ifname);
+	if (!netdev)
+		return -ENODEV;
+
+	if (!dev_is_pci(netdev->dev.parent)) {
+		err = -ENOTBLK;
+		goto out_put_dev;
+	}
+
+	if (to_pci_dev(netdev->dev.parent) != priv->pci_dev) {
+		err = -EXDEV;
+		goto out_put_dev;
+	}
+
+	if (bind_rx_queue->rxq_idx >= netdev->num_rx_queues) {
+		err = -ERANGE;
+		goto out_put_dev;
+	}
+
+	rxq = __netif_get_rx_queue(netdev, bind_rx_queue->rxq_idx);
+
+	err = xa_alloc(&priv->bound_rxq_list, &xa_id, rxq, xa_limit_32b,
+		       GFP_KERNEL);
+	if (err)
+		goto out_put_dev;
+	mutex_lock(&bind_rx_queue_mutex);
+
+	/* The DMA_BUF_CREATE_PAGES ioctl that creates the input file does a
+	 * dma_buf_attach(), which validates that the net_device we're trying to
+	 * attach to can reach the dmabuf, so we don't need to check here as
+	 * well.
+	 */
+	rcu_assign_pointer(rxq->dmabuf_pages, file);
+
+	mutex_unlock(&bind_rx_queue_mutex);
+
+	return 0;
+
+out_put_dev:
+	dev_put(netdev);
+	return err;
+}
+
+static long dma_buf_pages_ioctl(struct file *file, unsigned int op,
+				unsigned long arg)
+{
+	struct dma_buf_pages_bind_rx_queue bind_rx_queue;
+	void *input_ptr = (void *)arg;
+
+	switch (op) {
+	case DMA_BUF_PAGES_BIND_RX:
+		if (copy_from_user(&bind_rx_queue, input_ptr,
+				   sizeof(bind_rx_queue)))
+			return -EFAULT;
+		return dma_buf_pages_bind_rx_queue(file, &bind_rx_queue);
+	default:
+		return -EINVAL;
+	}
 }
 
 static void dma_buf_page_free(struct page *page)
@@ -1428,6 +1523,7 @@ static const struct dev_pagemap_ops dma_buf_pgmap_ops = {
 };
 
 static const struct file_operations dma_buf_pages_fops = {
+	.unlocked_ioctl	= dma_buf_pages_ioctl,
 	.release	= dma_buf_pages_release,
 };
 
@@ -1582,6 +1678,7 @@ static long dma_buf_create_pages(struct file *file,
 					 (void *)priv->pages);
 		if (err)
 			goto out_destroy_genpool;
+		xa_init_flags(&priv->bound_rxq_list, XA_FLAGS_ALLOC);
 		priv->tx_bv = NULL;
 	} else {
 		priv->page_pool = NULL;
